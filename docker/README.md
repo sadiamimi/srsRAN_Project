@@ -1,6 +1,6 @@
 # srsRAN Project Multi-Container Solution
 
-This folder contains multiple docker compose configurations for different deployment scenarios:
+# This folder contains multiple docker compose configurations for different deployment scenarios:
 
 ## Available Docker Compose Files
 
