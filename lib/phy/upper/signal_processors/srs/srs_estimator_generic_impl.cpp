@@ -38,6 +38,10 @@
 #include "srsran/srsvec/prod.h"
 #include "srsran/srsvec/sc_prod.h"
 #include "srsran/srsvec/subtract.h"
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+#include <cstring>
 
 using namespace srsran;
 
@@ -52,6 +56,90 @@ using namespace srsran;
   }
   return is_success;
 }
+
+// ==================== SRS CSI COLLECTION CONFIGURATION ====================
+// Configure SRS CSI collection by setting SRS_CSI_COLLECTION_MODE:
+//
+// MODE 0: Disabled (no collection)
+// MODE 1: Per-pilot CSI - Ĥ(k) on SRS comb tones only
+//   - File: srs_csi_YYYYMMDD_HHMMSS_NNN.bin (NNN = file sequence number)
+//   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Size: Small (~100-600 bytes per SRS occasion, depends on RB allocation)
+//   - Collection point: After TA/phase compensation, before averaging
+//   - Rotation: New file created when current file reaches 100MB
+//
+#define SRS_CSI_COLLECTION_MODE 1
+
+// File size limit (100 MB) - creates new file when reached
+#define SRS_CSI_MAX_FILE_SIZE (100UL * 1024 * 1024)
+
+// Output directory
+#define SRS_CSI_OUTPUT_DIR "/var/tmp/srsRAN_Project/SRS_CSI_Log"
+// ======================================================================
+
+#if (SRS_CSI_COLLECTION_MODE == 1)
+namespace {
+  // Global state for SRS CSI collection
+  struct SRSCSICollector {
+    int packet_counter = 0;
+    int file_counter = 0;
+    size_t current_file_size = 0;
+    std::string current_filename;
+    bool initialized = false;
+    
+    void rotate_file() {
+      file_counter++;
+      
+      // Generate new filename with sequence number
+      auto now = std::chrono::system_clock::now();
+      auto time_t_now = std::chrono::system_clock::to_time_t(now);
+      char time_str[32];
+      std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", std::localtime(&time_t_now));
+      
+      current_filename = std::string(SRS_CSI_OUTPUT_DIR) + "/srs_csi_" + 
+                        time_str + "_" + std::to_string(file_counter) + ".bin";
+      current_file_size = 0;
+    }
+    
+    void initialize() {
+      if (!initialized) {
+        // Create directory
+        std::filesystem::create_directories(SRS_CSI_OUTPUT_DIR);
+        
+        // Create first file
+        rotate_file();
+        initialized = true;
+      }
+    }
+    
+    bool should_write(size_t bytes_to_write) {
+      if (!initialized) {
+        initialize();
+      }
+      
+      // Check if we need to rotate
+      if (current_file_size + bytes_to_write > SRS_CSI_MAX_FILE_SIZE) {
+        rotate_file();
+      }
+      
+      return true;
+    }
+    
+    void update_size(size_t bytes_written) {
+      current_file_size += bytes_written;
+    }
+    
+    const std::string& get_filename() const {
+      return current_filename;
+    }
+  };
+  
+  // Global collector instance
+  static SRSCSICollector srs_collector;
+}
+#endif
+// ============================================================================
+
 
 void srs_estimator_generic_impl::compensate_phase_shift(span<cf_t> mean_lse,
                                                         float      phase_shift_subcarrier,
@@ -227,6 +315,74 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
 
       // Compensate phase shift.
       compensate_phase_shift(mean_lse, phase_shift_subcarrier, phase_shift_offset);
+
+#if (SRS_CSI_COLLECTION_MODE == 1)
+      // ===== SRS PER-PILOT CSI COLLECTION =====
+      // Captures Ĥ(k) on each SRS comb tone after TA/phase compensation
+      // Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+      {
+        srs_collector.packet_counter++;
+        
+        // Calculate size needed for this record
+        size_t header_size = 14;
+        size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
+        size_t total_size = header_size + sample_size;
+        
+        // Check if we should write (handles initialization and rotation)
+        if (srs_collector.should_write(total_size)) {
+          std::ofstream srs_file(srs_collector.get_filename(), 
+                                std::ios::binary | std::ios::app);
+          
+          if (srs_file.is_open()) {
+            // Get timestamp
+            auto now = std::chrono::system_clock::now();
+            auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count();
+            
+            // Write 14-byte header
+            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
+            int64_t ts = timestamp_us;
+            uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
+            uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
+            uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
+            
+            srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
+            srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
+            
+            // Write per-tone CSI samples: 12 bytes each
+            // subcarrier_index (2) + symbol_index (2) + real (4) + imag (4)
+            unsigned symbol_idx = config.resource.start_symbol.value();
+            
+            for (unsigned tone_idx = 0; tone_idx < mean_lse.size(); ++tone_idx) {
+              // Calculate actual subcarrier index in resource grid
+              // SRS uses comb pattern: k = k0 + tone_idx * comb_size
+              unsigned actual_subcarrier = info.mapping_initial_subcarrier + (tone_idx * comb_size);
+              
+              cf_t h_complex = mean_lse[tone_idx];
+              
+              // Write sample (12 bytes total)
+              uint16_t sc_idx = static_cast<uint16_t>(actual_subcarrier);
+              uint16_t sym_idx = static_cast<uint16_t>(symbol_idx);
+              float real_part = h_complex.real();
+              float imag_part = h_complex.imag();
+              
+              srs_file.write(reinterpret_cast<const char*>(&sc_idx), sizeof(sc_idx));
+              srs_file.write(reinterpret_cast<const char*>(&sym_idx), sizeof(sym_idx));
+              srs_file.write(reinterpret_cast<const char*>(&real_part), sizeof(real_part));
+              srs_file.write(reinterpret_cast<const char*>(&imag_part), sizeof(imag_part));
+            }
+            
+            srs_file.close();
+            
+            // Update file size tracker
+            srs_collector.update_size(total_size);
+          }
+        }
+      }
+#endif
+      // ========================================
 
       // Calculate channel wideband coefficient.
       cf_t coefficient = srsvec::mean(mean_lse);
