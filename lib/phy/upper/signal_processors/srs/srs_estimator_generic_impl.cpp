@@ -31,6 +31,7 @@
 #include "srsran/phy/upper/signal_processors/srs/srs_estimator_result.h"
 #include "srsran/ran/cyclic_prefix.h"
 #include "srsran/ran/srs/srs_constants.h"
+#include "srsran/ran/srs/srs_context_formatter.h"
 #include "srsran/ran/srs/srs_information.h"
 #include "srsran/srsvec/add.h"
 #include "srsran/srsvec/dot_prod.h"
@@ -63,7 +64,8 @@ using namespace srsran;
 // MODE 0: Disabled (no collection)
 // MODE 1: Per-pilot CSI - Ĥ(k) on SRS comb tones only
 //   - File: srs_csi_YYYYMMDD_HHMMSS_NNN.bin (NNN = file sequence number)
-//   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Format: 16-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Header: timestamp(8) + rnti(2) + rx_port(2) + tx_port(2) + num_tones(2)
 //   - Size: Small (~100-600 bytes per SRS occasion, depends on RB allocation)
 //   - Collection point: After TA/phase compensation, before averaging
 //   - Rotation: New file created when current file reaches 100MB
@@ -78,47 +80,93 @@ using namespace srsran;
 // ======================================================================
 
 #if (SRS_CSI_COLLECTION_MODE == 1)
+#include <map>
+
 namespace {
-  // Global state for SRS CSI collection
+  // Per-RNTI SRS CSI collector
   struct SRSCSICollector {
+    uint16_t rnti = 0;
     int packet_counter = 0;
     int file_counter = 0;
     size_t current_file_size = 0;
     std::string current_filename;
+    std::string session_start_time;
     bool initialized = false;
     
-    void rotate_file() {
-      file_counter++;
-      
-      // Generate new filename with sequence number
-      auto now = std::chrono::system_clock::now();
-      auto time_t_now = std::chrono::system_clock::to_time_t(now);
-      char time_str[32];
-      std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", std::localtime(&time_t_now));
-      
-      current_filename = std::string(SRS_CSI_OUTPUT_DIR) + "/srs_csi_" + 
-                        time_str + "_" + std::to_string(file_counter) + ".bin";
-      current_file_size = 0;
-    }
-    
-    void initialize() {
+    void initialize(uint16_t rnti_value) {
       if (!initialized) {
+        rnti = rnti_value;
+        
         // Create directory
         std::filesystem::create_directories(SRS_CSI_OUTPUT_DIR);
         
+        // Get current timestamp for session start
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        char time_str[32];
+        std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", std::localtime(&time_t_now));
+        session_start_time = std::string(time_str);
+        
         // Create first file
         rotate_file();
+        
+        // Write metadata entry
+        write_metadata_entry("session_start");
+        
         initialized = true;
       }
     }
     
-    bool should_write(size_t bytes_to_write) {
-      if (!initialized) {
-        initialize();
-      }
+    void rotate_file() {
+      file_counter++;
       
+      // Generate filename: srs_csi_rnti_0xXXXX_TIMESTAMP_N.bin (hex format)
+      char rnti_hex[8];
+      std::snprintf(rnti_hex, sizeof(rnti_hex), "0x%04x", rnti);
+      
+      current_filename = std::string(SRS_CSI_OUTPUT_DIR) + "/srs_csi_rnti_" + 
+                        std::string(rnti_hex) + "_" + 
+                        session_start_time + "_" + 
+                        std::to_string(file_counter) + ".bin";
+      current_file_size = 0;
+      
+      // Log rotation
+      if (file_counter > 1) {
+        write_metadata_entry("file_rotation");
+      }
+    }
+    
+    void write_metadata_entry(const std::string& event) {
+      // Append to metadata file (JSON Lines format)
+      std::ofstream meta_file(std::string(SRS_CSI_OUTPUT_DIR) + "/session_metadata.jsonl", 
+                             std::ios::app);
+      
+      if (meta_file.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        char time_str[64];
+        std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", 
+                      std::localtime(&time_t_now));
+        
+        // Get base filename without path
+        std::string basename = current_filename.substr(
+            current_filename.find_last_of("/") + 1);
+        
+        // Write JSON line
+        meta_file << "{"
+                  << "\"rnti\":" << rnti << ","
+                  << "\"file\":\"" << basename << "\","
+                  << "\"timestamp\":\"" << time_str << "\","
+                  << "\"event\":\"" << event << "\""
+                  << "}\n";
+        
+        meta_file.close();
+      }
+    }
+    
+    bool should_write(size_t bytes_to_write) {
       // Check if we need to rotate
-      if (current_file_size + bytes_to_write > SRS_CSI_MAX_FILE_SIZE) {
+      if (initialized && current_file_size + bytes_to_write > SRS_CSI_MAX_FILE_SIZE) {
         rotate_file();
       }
       
@@ -134,8 +182,8 @@ namespace {
     }
   };
   
-  // Global collector instance
-  static SRSCSICollector srs_collector;
+  // Map of collectors: one per RNTI (thread-safe via separate files)
+  static std::map<uint16_t, SRSCSICollector> rnti_collectors;
 }
 #endif
 // ============================================================================
@@ -317,20 +365,55 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
       compensate_phase_shift(mean_lse, phase_shift_subcarrier, phase_shift_offset);
 
 #if (SRS_CSI_COLLECTION_MODE == 1)
-      // ===== SRS PER-PILOT CSI COLLECTION =====
+      // ===== SRS PER-PILOT CSI COLLECTION (PER-RNTI FILES) =====
       // Captures Ĥ(k) on each SRS comb tone after TA/phase compensation
-      // Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+      // Format: 16-byte header + 12-byte samples (subcarrier, symbol, real, imag)
       {
-        srs_collector.packet_counter++;
+        // Extract RNTI from context (skip if not available)
+        if (!config.context.has_value()) {
+          // No context available, skip logging
+          continue;  // Skip to next port
+        }
+        
+        // Extract RNTI by parsing formatted context
+        // Format: "sector_id=X rnti=0xYYYY"
+        std::string context_str = fmt::format("{}", config.context.value());
+        size_t rnti_pos = context_str.find("rnti=0x");
+        if (rnti_pos == std::string::npos) {
+          continue;  // RNTI not found, skip
+        }
+        
+        uint16_t rnti_value = 0;
+        try {
+          std::string rnti_hex = context_str.substr(rnti_pos + 7);  // Skip "rnti=0x"
+          rnti_value = static_cast<uint16_t>(std::stoul(rnti_hex, nullptr, 16));
+        } catch (...) {
+          continue;  // Parse failed, skip
+        }
+        
+        // Skip if RNTI is 0 (invalid)
+        if (rnti_value == 0) {
+          continue;
+        }
+        
+        // Get or create collector for this RNTI
+        auto& collector = rnti_collectors[rnti_value];
+        
+        // Initialize on first use
+        if (!collector.initialized) {
+          collector.initialize(rnti_value);
+        }
+        
+        collector.packet_counter++;
         
         // Calculate size needed for this record
-        size_t header_size = 14;
+        size_t header_size = 16;  // Updated: now includes RNTI
         size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
         size_t total_size = header_size + sample_size;
         
-        // Check if we should write (handles initialization and rotation)
-        if (srs_collector.should_write(total_size)) {
-          std::ofstream srs_file(srs_collector.get_filename(), 
+        // Check if we should write (handles rotation)
+        if (collector.should_write(total_size)) {
+          std::ofstream srs_file(collector.get_filename(), 
                                 std::ios::binary | std::ios::app);
           
           if (srs_file.is_open()) {
@@ -339,14 +422,16 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 now.time_since_epoch()).count();
             
-            // Write 14-byte header
-            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
+            // Write 16-byte header
+            // timestamp (8) + rnti (2) + rx_port (2) + tx_port (2) + sequence_length (2)
             int64_t ts = timestamp_us;
+            uint16_t rnti_u16 = rnti_value;
             uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
             uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
             uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
             
             srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
+            srs_file.write(reinterpret_cast<const char*>(&rnti_u16), sizeof(rnti_u16));
             srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
             srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
             srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
@@ -377,7 +462,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             srs_file.close();
             
             // Update file size tracker
-            srs_collector.update_size(total_size);
+            collector.update_size(total_size);
           }
         }
       }

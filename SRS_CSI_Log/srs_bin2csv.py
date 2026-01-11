@@ -4,8 +4,9 @@ SRS CSI Binary to CSV Converter
 Converts binary SRS CSI log files to human-readable CSV format.
 
 Binary Format (per entry):
-- Header (14 bytes):
+- Header (16 bytes):
   - timestamp_us (8 bytes, uint64): Microseconds since epoch
+  - rnti (2 bytes, uint16): UE Radio Network Temporary Identifier  
   - rx_port (2 bytes, uint16): Receive antenna port
   - tx_port (2 bytes, uint16): Transmit antenna port (UE)
   - num_tones (2 bytes, uint16): Number of SRS tones in this entry
@@ -27,16 +28,16 @@ import math
 
 def read_srs_entry(f):
     """Read one SRS CSI entry from binary file."""
-    # Read header (14 bytes)
-    header_data = f.read(14)
-    if len(header_data) < 14:
+    # Read header (16 bytes)
+    header_data = f.read(16)
+    if len(header_data) < 16:
         return None
     
-    timestamp_us, rx_port, tx_port, num_tones = struct.unpack('<QHHH', header_data)
+    timestamp_us, rnti, rx_port, tx_port, num_tones = struct.unpack('<QHHHH', header_data)
     
     # Sanity check: num_tones should be reasonable (0-3276 max for 20MHz BW)
     if num_tones > 10000 or num_tones == 0:
-        print(f"Warning: Suspicious num_tones={num_tones} at file position {f.tell()-14}")
+        print(f"Warning: Suspicious num_tones={num_tones} at file position {f.tell()-16}")
         return None
     
     # Read samples (12 bytes each)
@@ -55,6 +56,7 @@ def read_srs_entry(f):
     
     return {
         'timestamp_us': timestamp_us,
+        'rnti': rnti,
         'rx_port': rx_port,
         'tx_port': tx_port,
         'num_tones': num_tones,
@@ -95,7 +97,7 @@ def main():
     try:
         with open(input_filename, 'rb') as infile, open(output_filename, 'w') as outfile:
             # Write CSV header
-            outfile.write("entry_num,timestamp_us,timestamp_readable,rx_port,tx_port,num_tones,")
+            outfile.write("entry_num,timestamp_us,timestamp_readable,rnti,rx_port,tx_port,num_tones,")
             outfile.write("subcarrier,symbol,real,imag,magnitude,phase_deg\n")
             
             while True:
@@ -113,7 +115,7 @@ def main():
                     phase_deg = math.degrees(math.atan2(imag_part, real_part))
                     
                     outfile.write(f"{entry_count},{entry['timestamp_us']},{timestamp_readable},")
-                    outfile.write(f"{entry['rx_port']},{entry['tx_port']},{entry['num_tones']},")
+                    outfile.write(f"{entry['rnti']},{entry['rx_port']},{entry['tx_port']},{entry['num_tones']},")
                     outfile.write(f"{subcarrier_idx},{symbol_idx},")
                     outfile.write(f"{real_part:.6f},{imag_part:.6f},{magnitude:.6f},{phase_deg:.2f}\n")
                     
