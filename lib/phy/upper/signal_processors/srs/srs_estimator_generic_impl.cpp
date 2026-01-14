@@ -62,15 +62,25 @@ using namespace srsran;
 // Configure SRS CSI collection by setting SRS_CSI_COLLECTION_MODE:
 //
 // MODE 0: Disabled (no collection)
-// MODE 1: Per-pilot CSI - Ĥ(k) on SRS comb tones only
-//   - File: srs_csi_YYYYMMDD_HHMMSS_NNN.bin (NNN = file sequence number)
-//   - Format: 16-byte header + 12-byte samples (subcarrier, symbol, real, imag)
-//   - Header: timestamp(8) + rnti(2) + rx_port(2) + tx_port(2) + num_tones(2)
+// MODE 1: Per-pilot CSI - Ĥ(k) on SRS comb tones only (Multi-UE, per-RNTI files)
+//   - File: srs_csi_rnti_0xXXXX_YYYYMMDD_HHMMSS_N.bin (RNTI in filename)
+//   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) [NO RNTI in header]
 //   - Size: Small (~100-600 bytes per SRS occasion, depends on RB allocation)
 //   - Collection point: After TA/phase compensation, before averaging
 //   - Rotation: New file created when current file reaches 100MB
+//   - Use case: Multi-UE scenarios, separate files per UE
 //
-#define SRS_CSI_COLLECTION_MODE 1
+// MODE 2: Single UE CSI - Ĥ(k) on SRS comb tones (all data in one file)
+//   - File: srs_csi_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
+//   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) [NO RNTI in header]
+//   - Size: Small (~100-600 bytes per SRS occasion)
+//   - Collection point: After TA/phase compensation, before averaging
+//   - Rotation: New file created when current file reaches 100MB
+//   - Use case: Single UE testing, simpler format
+//
+#define SRS_CSI_COLLECTION_MODE 2
 
 // File size limit (100 MB) - creates new file when reached
 #define SRS_CSI_MAX_FILE_SIZE (100UL * 1024 * 1024)
@@ -184,6 +194,69 @@ namespace {
   
   // Map of collectors: one per RNTI (thread-safe via separate files)
   static std::map<uint16_t, SRSCSICollector> rnti_collectors;
+}
+#endif
+
+#if (SRS_CSI_COLLECTION_MODE == 2)
+// Single UE mode - one global file for all CSI data
+namespace {
+  struct SingleUECSICollector {
+    int packet_counter = 0;
+    int file_counter = 0;
+    size_t current_file_size = 0;
+    std::string current_filename;
+    std::string session_start_time;
+    bool initialized = false;
+    
+    void initialize() {
+      if (!initialized) {
+        // Create directory
+        std::filesystem::create_directories(SRS_CSI_OUTPUT_DIR);
+        
+        // Get current timestamp for session start
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        char time_str[32];
+        std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", std::localtime(&time_t_now));
+        session_start_time = std::string(time_str);
+        
+        // Create first file
+        rotate_file();
+        
+        initialized = true;
+      }
+    }
+    
+    void rotate_file() {
+      file_counter++;
+      
+      // Generate filename: srs_csi_YYYYMMDD_HHMMSS_N.bin (no RNTI)
+      current_filename = std::string(SRS_CSI_OUTPUT_DIR) + "/srs_csi_" + 
+                        session_start_time + "_" + 
+                        std::to_string(file_counter) + ".bin";
+      current_file_size = 0;
+    }
+    
+    bool should_write(size_t bytes_to_write) {
+      // Check if we need to rotate
+      if (initialized && current_file_size + bytes_to_write > SRS_CSI_MAX_FILE_SIZE) {
+        rotate_file();
+      }
+      
+      return true;
+    }
+    
+    void update_size(size_t bytes_written) {
+      current_file_size += bytes_written;
+    }
+    
+    const std::string& get_filename() const {
+      return current_filename;
+    }
+  };
+  
+  // Single global collector for all UEs
+  static SingleUECSICollector single_collector;
 }
 #endif
 // ============================================================================
@@ -407,7 +480,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         collector.packet_counter++;
         
         // Calculate size needed for this record
-        size_t header_size = 16;  // Updated: now includes RNTI
+        size_t header_size = 14;  // NO RNTI in header (RNTI is in filename)
         size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
         size_t total_size = header_size + sample_size;
         
@@ -422,16 +495,14 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 now.time_since_epoch()).count();
             
-            // Write 16-byte header
-            // timestamp (8) + rnti (2) + rx_port (2) + tx_port (2) + sequence_length (2)
+            // Write 14-byte header (NO RNTI - it's in the filename)
+            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
             int64_t ts = timestamp_us;
-            uint16_t rnti_u16 = rnti_value;
             uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
             uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
             uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
             
             srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
-            srs_file.write(reinterpret_cast<const char*>(&rnti_u16), sizeof(rnti_u16));
             srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
             srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
             srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
@@ -463,6 +534,83 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             
             // Update file size tracker
             collector.update_size(total_size);
+          }
+        }
+      }
+#endif
+      // ========================================
+
+#if (SRS_CSI_COLLECTION_MODE == 2)
+      // ===== SINGLE UE SRS CSI COLLECTION (ONE FILE) =====
+      // Captures Ĥ(k) on each SRS comb tone after TA/phase compensation
+      // Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+      // No RNTI tracking - all data goes to one file
+      {
+        // Initialize collector on first use
+        if (!single_collector.initialized) {
+          single_collector.initialize();
+        }
+        
+        single_collector.packet_counter++;
+        
+        // Calculate size needed for this record
+        size_t header_size = 14;  // timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2)
+        size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
+        size_t total_size = header_size + sample_size;
+        
+        // Check if we should write (handles rotation)
+        if (single_collector.should_write(total_size)) {
+          std::ofstream srs_file(single_collector.get_filename(), 
+                                std::ios::binary | std::ios::app);
+          
+          if (srs_file.is_open()) {
+            // Get timestamp
+            auto now = std::chrono::system_clock::now();
+            auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count();
+            
+            // Write 14-byte header (NO RNTI)
+            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
+            int64_t ts = timestamp_us;
+            uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
+            uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
+            uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
+            
+            srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
+            srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
+            
+            // Write per-tone CSI samples: 12 bytes each
+            // subcarrier_index (2) + symbol_index (2) + real (4) + imag (4)
+            unsigned symbol_idx = config.resource.start_symbol.value();
+            
+            // Get SRS information for subcarrier calculation
+            srs_information info_mode2 = get_srs_information(config.resource, i_antenna_port);
+            
+            for (unsigned tone_idx = 0; tone_idx < mean_lse.size(); ++tone_idx) {
+              // Calculate actual subcarrier index in resource grid
+              // SRS uses comb pattern: k = k0 + tone_idx * comb_size
+              unsigned actual_subcarrier = info_mode2.mapping_initial_subcarrier + (tone_idx * comb_size);
+              
+              cf_t h_complex = mean_lse[tone_idx];
+              
+              // Write sample (12 bytes total)
+              uint16_t sc_idx = static_cast<uint16_t>(actual_subcarrier);
+              uint16_t sym_idx = static_cast<uint16_t>(symbol_idx);
+              float real_part = h_complex.real();
+              float imag_part = h_complex.imag();
+              
+              srs_file.write(reinterpret_cast<const char*>(&sc_idx), sizeof(sc_idx));
+              srs_file.write(reinterpret_cast<const char*>(&sym_idx), sizeof(sym_idx));
+              srs_file.write(reinterpret_cast<const char*>(&real_part), sizeof(real_part));
+              srs_file.write(reinterpret_cast<const char*>(&imag_part), sizeof(imag_part));
+            }
+            
+            srs_file.close();
+            
+            // Update file size tracker
+            single_collector.update_size(total_size);
           }
         }
       }
