@@ -62,23 +62,23 @@ using namespace srsran;
 // Configure SRS CSI collection by setting SRS_CSI_COLLECTION_MODE:
 //
 // MODE 0: Disabled (no collection)
-// MODE 1: Per-pilot CSI - Ĥ_raw(k) on SRS comb tones only (Multi-UE, per-RNTI files)
+// MODE 1: Per-pilot CSI - Ĥ(k) on SRS comb tones only (Multi-UE, per-RNTI files)
 //   - File: srs_csi_rnti_0xXXXX_YYYYMMDD_HHMMSS_N.bin (RNTI in filename)
 //   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
 //   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) [NO RNTI in header]
 //   - Size: Small (~100-600 bytes per SRS occasion, depends on RB allocation)
-//   - Collection point: After LS estimation, BEFORE TA/phase compensation (RAW H)
+//   - Collection point: After TA/phase compensation, before averaging
 //   - Rotation: New file created when current file reaches 100MB
-//   - Use case: Multi-UE scenarios, separate files per UE, raw channel estimates
+//   - Use case: Multi-UE scenarios, separate files per UE
 //
-// MODE 2: Single UE CSI - Ĥ_raw(k) on SRS comb tones (all data in one file)
+// MODE 2: Single UE CSI - Ĥ(k) on SRS comb tones (all data in one file)
 //   - File: srs_csi_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
 //   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
 //   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) [NO RNTI in header]
 //   - Size: Small (~100-600 bytes per SRS occasion)
-//   - Collection point: After LS estimation, BEFORE TA/phase compensation (RAW H)
+//   - Collection point: After TA/phase compensation, before averaging
 //   - Rotation: New file created when current file reaches 100MB
-//   - Use case: Single UE testing, raw uncompensated channel estimates
+//   - Use case: Single UE testing, simpler format
 //
 #define SRS_CSI_COLLECTION_MODE 2
 
@@ -396,115 +396,45 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         srsvec::sc_prod(mean_lse, mean_lse, 1.0 / static_cast<float>(nof_symbols));
       }
 
-#if (SRS_CSI_COLLECTION_MODE == 1)
-      // ===== RAW H COLLECTION PER-RNTI (BEFORE TA/PHASE COMPENSATION) =====
-      // Captures Ĥ_raw(k) = Y(k) * conj(S(k)) on each SRS comb tone
-      // This is the RAW channel estimate without TA/phase corrections
-      {
-        // Extract RNTI from context (skip if not available)
-        if (!config.context.has_value()) {
-          // No context available, skip logging
-          goto skip_mode1_collection;
-        }
-        
-        // Extract RNTI by parsing formatted context
-        // Format: "sector_id=X rnti=0xYYYY"
-        std::string context_str = fmt::format("{}", config.context.value());
-        size_t rnti_pos = context_str.find("rnti=0x");
-        if (rnti_pos == std::string::npos) {
-          goto skip_mode1_collection;
-        }
-        
-        uint16_t rnti_value = 0;
-        try {
-          std::string rnti_hex = context_str.substr(rnti_pos + 7);  // Skip "rnti=0x"
-          rnti_value = static_cast<uint16_t>(std::stoul(rnti_hex, nullptr, 16));
-        } catch (...) {
-          goto skip_mode1_collection;
-        }
-        
-        // Skip if RNTI is 0 (invalid)
-        if (rnti_value == 0) {
-          goto skip_mode1_collection;
-        }
-        
-        // Get or create collector for this RNTI
-        auto& collector = rnti_collectors[rnti_value];
-        
-        // Initialize on first use
-        if (!collector.initialized) {
-          collector.initialize(rnti_value);
-        }
-        
-        collector.packet_counter++;
-        
-        // Calculate size needed for this record
-        size_t header_size = 14;  // NO RNTI in header (RNTI is in filename)
-        size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
-        size_t total_size = header_size + sample_size;
-        
-        // Check if we should write (handles rotation)
-        if (collector.should_write(total_size)) {
-          std::ofstream srs_file(collector.get_filename(), 
-                                std::ios::binary | std::ios::app);
-          
-          if (srs_file.is_open()) {
-            // Get timestamp
-            auto now = std::chrono::system_clock::now();
-            auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                now.time_since_epoch()).count();
-            
-            // Write 14-byte header (NO RNTI - it's in the filename)
-            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
-            int64_t ts = timestamp_us;
-            uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port_index);
-            uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
-            uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
-            
-            srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
-            srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
-            srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
-            srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
-            
-            // Write per-tone RAW H samples: 12 bytes each
-            // subcarrier_index (2) + symbol_index (2) + real (4) + imag (4)
-            unsigned symbol_idx = config.resource.start_symbol.value();
-            
-            for (unsigned tone_idx = 0; tone_idx < mean_lse.size(); ++tone_idx) {
-              // Calculate actual subcarrier index in resource grid
-              // SRS uses comb pattern: k = k0 + tone_idx * comb_size
-              unsigned actual_subcarrier = info.mapping_initial_subcarrier + (tone_idx * comb_size);
-              
-              cf_t h_raw_complex = mean_lse[tone_idx];
-              
-              // Write sample (12 bytes total)
-              uint16_t sc_idx = static_cast<uint16_t>(actual_subcarrier);
-              uint16_t sym_idx = static_cast<uint16_t>(symbol_idx);
-              float real_part = h_raw_complex.real();
-              float imag_part = h_raw_complex.imag();
-              
-              srs_file.write(reinterpret_cast<const char*>(&sc_idx), sizeof(sc_idx));
-              srs_file.write(reinterpret_cast<const char*>(&sym_idx), sizeof(sym_idx));
-              srs_file.write(reinterpret_cast<const char*>(&real_part), sizeof(real_part));
-              srs_file.write(reinterpret_cast<const char*>(&imag_part), sizeof(imag_part));
-            }
-            
-            srs_file.close();
-            
-            // Update file size tracker
-            collector.update_size(total_size);
-          }
-        }
-        
-        skip_mode1_collection:;
-      }
-#endif
-      // ========================================
+      port_lse.set_slice(i_rx_port_index, mean_lse);
+    }
 
-#if (SRS_CSI_COLLECTION_MODE == 2)
-      // ===== RAW H COLLECTION (BEFORE TA/PHASE COMPENSATION) =====
-      // Captures Ĥ_raw(k) = Y(k) * conj(S(k)) on each SRS comb tone
-      // This is the RAW channel estimate without TA/phase corrections
+    // Estimate TA. Note that, since port_lse still contains the contributions of the other Tx ports (which cancel out
+    // only when averaging across subcarriers), the channel impulse response of the channel will show a number of
+    // replicas. However, since the TA estimator picks the peak closest to the origin (i.e., the one corresponding to
+    // the first replica), the estimation is still valid.
+    time_alignment_measurement ta_meas = deps.ta_estimator->estimate(port_lse, info.comb_size, scs, max_ta);
+
+    // Combine time alignment measurements.
+    result.time_alignment.time_alignment += ta_meas.time_alignment;
+    result.time_alignment.min        = std::max(result.time_alignment.min, ta_meas.min);
+    result.time_alignment.max        = std::min(result.time_alignment.max, ta_meas.max);
+    result.time_alignment.resolution = std::max(result.time_alignment.resolution, ta_meas.resolution);
+  }
+
+  // Average time alignment across all paths.
+  result.time_alignment.time_alignment /= nof_antenna_ports;
+
+  float noise_var = 0;
+  float rsrp      = 0;
+  // Compensate time alignment and estimate channel coefficients.
+  for (unsigned i_rx_port = 0; i_rx_port != nof_rx_ports; ++i_rx_port) {
+    for (unsigned i_antenna_port = 0; i_antenna_port != nof_antenna_ports; ++i_antenna_port) {
+      // View to the mean LSE for a port combination.
+      span<cf_t> mean_lse = temp_lse.get_view({i_rx_port, i_antenna_port});
+
+      // Get sequence information.
+      srs_information info = get_srs_information(config.resource, i_antenna_port);
+
+      // Calculate subcarrier phase shift in radians.
+      auto phase_shift_subcarrier =
+          static_cast<float>(TWOPI * result.time_alignment.time_alignment * scs_to_khz(scs) * 1000 * comb_size);
+
+      // Calculate the initial phase shift in radians.
+      float phase_shift_offset =
+          phase_shift_subcarrier * static_cast<float>(info.mapping_initial_subcarrier) / static_cast<float>(comb_size);
+
+      // Compensate phase shift.
       compensate_phase_shift(mean_lse, phase_shift_subcarrier, phase_shift_offset);
 
 #if (SRS_CSI_COLLECTION_MODE == 1)
@@ -604,6 +534,83 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             
             // Update file size tracker
             collector.update_size(total_size);
+          }
+        }
+      }
+#endif
+      // ========================================
+
+#if (SRS_CSI_COLLECTION_MODE == 2)
+      // ===== SINGLE UE SRS CSI COLLECTION (ONE FILE) =====
+      // Captures Ĥ(k) on each SRS comb tone after TA/phase compensation
+      // Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+      // No RNTI tracking - all data goes to one file
+      {
+        // Initialize collector on first use
+        if (!single_collector.initialized) {
+          single_collector.initialize();
+        }
+        
+        single_collector.packet_counter++;
+        
+        // Calculate size needed for this record
+        size_t header_size = 14;  // timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2)
+        size_t sample_size = mean_lse.size() * 12;  // 12 bytes per sample
+        size_t total_size = header_size + sample_size;
+        
+        // Check if we should write (handles rotation)
+        if (single_collector.should_write(total_size)) {
+          std::ofstream srs_file(single_collector.get_filename(), 
+                                std::ios::binary | std::ios::app);
+          
+          if (srs_file.is_open()) {
+            // Get timestamp
+            auto now = std::chrono::system_clock::now();
+            auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count();
+            
+            // Write 14-byte header (NO RNTI)
+            // timestamp (8) + rx_port (2) + tx_port (2) + sequence_length (2)
+            int64_t ts = timestamp_us;
+            uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
+            uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
+            uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
+            
+            srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
+            srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
+            
+            // Write per-tone CSI samples: 12 bytes each
+            // subcarrier_index (2) + symbol_index (2) + real (4) + imag (4)
+            unsigned symbol_idx = config.resource.start_symbol.value();
+            
+            // Get SRS information for subcarrier calculation
+            srs_information info_mode2 = get_srs_information(config.resource, i_antenna_port);
+            
+            for (unsigned tone_idx = 0; tone_idx < mean_lse.size(); ++tone_idx) {
+              // Calculate actual subcarrier index in resource grid
+              // SRS uses comb pattern: k = k0 + tone_idx * comb_size
+              unsigned actual_subcarrier = info_mode2.mapping_initial_subcarrier + (tone_idx * comb_size);
+              
+              cf_t h_complex = mean_lse[tone_idx];
+              
+              // Write sample (12 bytes total)
+              uint16_t sc_idx = static_cast<uint16_t>(actual_subcarrier);
+              uint16_t sym_idx = static_cast<uint16_t>(symbol_idx);
+              float real_part = h_complex.real();
+              float imag_part = h_complex.imag();
+              
+              srs_file.write(reinterpret_cast<const char*>(&sc_idx), sizeof(sc_idx));
+              srs_file.write(reinterpret_cast<const char*>(&sym_idx), sizeof(sym_idx));
+              srs_file.write(reinterpret_cast<const char*>(&real_part), sizeof(real_part));
+              srs_file.write(reinterpret_cast<const char*>(&imag_part), sizeof(imag_part));
+            }
+            
+            srs_file.close();
+            
+            // Update file size tracker
+            single_collector.update_size(total_size);
           }
         }
       }
