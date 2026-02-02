@@ -82,13 +82,12 @@ using namespace srsran;
 //
 // MODE 3: RAW Single UE CSI - Ĥ(k) BEFORE TA/phase compensation (all data in one file)
 //   - File: srs_csi_raw_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
-//   - Format: 32-byte header + 12-byte samples (subcarrier, symbol, real, imag)
-//   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) + 
-//             time_alignment(8) + scs_khz(4) + comb_size(2) + k0(2) + start_symbol(2)
+//   - Format: 14-byte header + 12-byte samples (subcarrier, symbol, real, imag)
+//   - Header: timestamp(8) + rx_port(2) + tx_port(2) + num_tones(2) [NO RNTI in header]
 //   - Size: Small (~100-600 bytes per SRS occasion)
 //   - Collection point: BEFORE TA/phase compensation (RAW CSI)
 //   - Rotation: New file created when current file reaches 100MB
-//   - Use case: Single UE testing, raw uncompensated channel data with TA parameters for offline compensation
+//   - Use case: Single UE testing, raw uncompensated channel data
 //
 #define SRS_CSI_COLLECTION_MODE 3
 
@@ -541,7 +540,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             
             // Get SRS information for configuration parameters
             srs_information info_raw = get_srs_information(config.resource, i_antenna_port);
-            unsigned comb_size_val = to_value(config.resource.comb_size);
+            unsigned comb_size_val = static_cast<unsigned>(config.resource.comb_size);
             
             // Write 32-byte header with TA and configuration parameters
             // Basic info (14 bytes)
