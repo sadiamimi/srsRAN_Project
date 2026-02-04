@@ -342,6 +342,69 @@ namespace {
   static RawSingleUECSICollector raw_single_collector;
 }
 #endif
+
+#if (SRS_CSI_COLLECTION_MODE == 4)
+// Single UE mode - FULL CSI with X[k], Y[k], H[k] and metrics
+namespace {
+  struct FullSingleUECSICollector {
+    int packet_counter = 0;
+    int file_counter = 0;
+    size_t current_file_size = 0;
+    std::string current_filename;
+    std::string session_start_time;
+    bool initialized = false;
+    
+    void initialize() {
+      if (!initialized) {
+        // Create directory
+        std::filesystem::create_directories(SRS_CSI_OUTPUT_DIR);
+        
+        // Get current timestamp for session start
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        char time_str[32];
+        std::strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", std::localtime(&time_t_now));
+        session_start_time = std::string(time_str);
+        
+        // Create first file
+        rotate_file();
+        
+        initialized = true;
+      }
+    }
+    
+    void rotate_file() {
+      file_counter++;
+      
+      // Generate filename: srs_csi_full_YYYYMMDD_HHMMSS_N.bin (no RNTI)
+      current_filename = std::string(SRS_CSI_OUTPUT_DIR) + "/srs_csi_full_" + 
+                        session_start_time + "_" + 
+                        std::to_string(file_counter) + ".bin";
+      current_file_size = 0;
+    }
+    
+    bool should_write(size_t bytes_to_write) {
+      // Check if we need to rotate
+      if (initialized && current_file_size + bytes_to_write > SRS_CSI_MAX_FILE_SIZE) {
+        rotate_file();
+      }
+      
+      return true;
+    }
+    
+    void update_size(size_t bytes_written) {
+      current_file_size += bytes_written;
+    }
+    
+    const std::string& get_filename() const {
+      return current_filename;
+    }
+  };
+  
+  // Single global collector for all UEs (FULL)
+  static FullSingleUECSICollector full_single_collector;
+}
+#endif
 // ============================================================================
 
 
@@ -612,7 +675,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
 
 #if (SRS_CSI_COLLECTION_MODE == 4)
       // Save raw channel estimate before compensation
-      static_vector<cf_t, max_seq_length> mean_lse_raw = mean_lse;
+      static_vector<cf_t, max_seq_length> mean_lse_raw(mean_lse.begin(), mean_lse.end());
 #endif
 
       // Compensate phase shift.
@@ -625,11 +688,11 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
       // plus RSRP, noise variance, and SNR
       {
         // Initialize collector on first use
-        if (!raw_single_collector.initialized) {
-          raw_single_collector.initialize();
+        if (!full_single_collector.initialized) {
+          full_single_collector.initialize();
         }
         
-        raw_single_collector.packet_counter++;
+        full_single_collector.packet_counter++;
         
         // Calculate SNR metrics (placeholders - actual metrics computed at end of function)
         float rsrp_linear = 0.0f;
@@ -642,8 +705,8 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         size_t sample_size = mean_lse.size() * 36;
         size_t total_size = header_size + sample_size;
         
-        if (raw_single_collector.should_write(total_size)) {
-          std::ofstream srs_file(raw_single_collector.get_filename(), 
+        if (full_single_collector.should_write(total_size)) {
+          std::ofstream srs_file(full_single_collector.get_filename(), 
                                 std::ios::binary | std::ios::app);
           
           if (srs_file.is_open()) {
@@ -717,7 +780,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             }
             
             srs_file.close();
-            raw_single_collector.update_size(total_size);
+            full_single_collector.update_size(total_size);
           }
         }
       }
