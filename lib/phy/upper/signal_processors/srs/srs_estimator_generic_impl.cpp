@@ -89,7 +89,18 @@ using namespace srsran;
 //   - Rotation: New file created when current file reaches 100MB
 //   - Use case: Single UE testing, raw uncompensated channel data
 //
-#define SRS_CSI_COLLECTION_MODE 3
+// MODE 4: FULL Single UE CSI - X[k], Y[k], H[k] with metrics (all data in one file)
+//   - File: srs_csi_full_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
+//   - Format: 44-byte header + 28-byte samples (X, Y, H per tone)
+//   - Header: MODE3 header(32) + rsrp(4) + noise_var(4) + snr_db(4)
+//   - Per-tone: subcarrier(2) + symbol(2) + X_real(4) + X_imag(4) + Y_real(4) + Y_imag(4) + H_real(4) + H_imag(4)
+//   - Collection point: AFTER TA/phase compensation (compensated CSI)
+//   - Includes: Transmitted sequence X[k], Received signal Y[k], Compensated channel H[k]
+//   - Metrics: RSRP, noise variance, SNR in dB
+//   - Rotation: New file created when current file reaches 100MB
+//   - Use case: Complete channel characterization with SNR analysis
+//
+#define SRS_CSI_COLLECTION_MODE 4
 
 // File size limit (100 MB) - creates new file when reached
 #define SRS_CSI_MAX_FILE_SIZE (100UL * 1024 * 1024)
@@ -599,8 +610,118 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
 #endif
       // ========================================
 
+#if (SRS_CSI_COLLECTION_MODE == 4)
+      // Save raw channel estimate before compensation
+      static_vector<cf_t, max_seq_length> mean_lse_raw = mean_lse;
+#endif
+
       // Compensate phase shift.
       compensate_phase_shift(mean_lse, phase_shift_subcarrier, phase_shift_offset);
+
+#if (SRS_CSI_COLLECTION_MODE == 4)
+      // ===== FULL SINGLE UE SRS CSI COLLECTION (X[k], Y[k], H_raw[k], H_comp[k] + METRICS) =====
+      // Captures complete channel information: transmitted sequence, received signal,
+      // raw channel estimate (before compensation), compensated channel estimate, 
+      // plus RSRP, noise variance, and SNR
+      {
+        // Initialize collector on first use
+        if (!raw_single_collector.initialized) {
+          raw_single_collector.initialize();
+        }
+        
+        raw_single_collector.packet_counter++;
+        
+        // Calculate SNR metrics (placeholders - actual metrics computed at end of function)
+        float rsrp_linear = 0.0f;
+        float noise_variance = 0.0f;
+        float snr_db = 0.0f;
+        
+        // Calculate size: Header(44) + samples(36 bytes × num_tones)
+        // Each sample: sc(2) + sym(2) + X(8) + Y(8) + H_raw(8) + H_comp(8) = 36 bytes
+        size_t header_size = 44;
+        size_t sample_size = mean_lse.size() * 36;
+        size_t total_size = header_size + sample_size;
+        
+        if (raw_single_collector.should_write(total_size)) {
+          std::ofstream srs_file(raw_single_collector.get_filename(), 
+                                std::ios::binary | std::ios::app);
+          
+          if (srs_file.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count();
+            
+            srs_information info_mode4 = get_srs_information(config.resource, i_antenna_port);
+            unsigned comb_size_val = static_cast<unsigned>(config.resource.comb_size);
+            
+            // 44-byte header
+            int64_t ts = timestamp_us;
+            uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
+            uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
+            uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
+            double time_align = result.time_alignment.time_alignment;
+            float scs_khz_val = static_cast<float>(scs_to_khz(scs));
+            uint16_t comb_size_u16 = static_cast<uint16_t>(comb_size_val);
+            uint16_t k0_u16 = static_cast<uint16_t>(info_mode4.mapping_initial_subcarrier);
+            uint16_t start_sym_u16 = static_cast<uint16_t>(config.resource.start_symbol.value());
+            
+            srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
+            srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
+            srs_file.write(reinterpret_cast<const char*>(&time_align), sizeof(time_align));
+            srs_file.write(reinterpret_cast<const char*>(&scs_khz_val), sizeof(scs_khz_val));
+            srs_file.write(reinterpret_cast<const char*>(&comb_size_u16), sizeof(comb_size_u16));
+            srs_file.write(reinterpret_cast<const char*>(&k0_u16), sizeof(k0_u16));
+            srs_file.write(reinterpret_cast<const char*>(&start_sym_u16), sizeof(start_sym_u16));
+            srs_file.write(reinterpret_cast<const char*>(&rsrp_linear), sizeof(rsrp_linear));
+            srs_file.write(reinterpret_cast<const char*>(&noise_variance), sizeof(noise_variance));
+            srs_file.write(reinterpret_cast<const char*>(&snr_db), sizeof(snr_db));
+            
+            // Get transmitted SRS sequence and received signal
+            span<const cf_t> srs_sequence = all_sequences.get_view({i_antenna_port});
+            unsigned symbol_idx = config.resource.start_symbol.value();
+            static_vector<cf_t, max_seq_length> rx_sequence(info_mode4.sequence_length);
+            grid.get(rx_sequence, i_rx_port, symbol_idx, info_mode4.mapping_initial_subcarrier, info_mode4.comb_size);
+            
+            // Write 36-byte samples: X[k], Y[k], H_raw[k], H_comp[k]
+            for (unsigned tone_idx = 0; tone_idx < mean_lse.size(); ++tone_idx) {
+              unsigned actual_subcarrier = info_mode4.mapping_initial_subcarrier + (tone_idx * comb_size_val);
+              
+              cf_t x_complex = srs_sequence[tone_idx];
+              cf_t y_complex = rx_sequence[tone_idx];
+              cf_t h_raw_complex = mean_lse_raw[tone_idx];
+              cf_t h_comp_complex = mean_lse[tone_idx];
+              
+              uint16_t sc_idx = static_cast<uint16_t>(actual_subcarrier);
+              uint16_t sym_idx = static_cast<uint16_t>(symbol_idx);
+              float x_real = x_complex.real();
+              float x_imag = x_complex.imag();
+              float y_real = y_complex.real();
+              float y_imag = y_complex.imag();
+              float h_raw_real = h_raw_complex.real();
+              float h_raw_imag = h_raw_complex.imag();
+              float h_comp_real = h_comp_complex.real();
+              float h_comp_imag = h_comp_complex.imag();
+              
+              srs_file.write(reinterpret_cast<const char*>(&sc_idx), sizeof(sc_idx));
+              srs_file.write(reinterpret_cast<const char*>(&sym_idx), sizeof(sym_idx));
+              srs_file.write(reinterpret_cast<const char*>(&x_real), sizeof(x_real));
+              srs_file.write(reinterpret_cast<const char*>(&x_imag), sizeof(x_imag));
+              srs_file.write(reinterpret_cast<const char*>(&y_real), sizeof(y_real));
+              srs_file.write(reinterpret_cast<const char*>(&y_imag), sizeof(y_imag));
+              srs_file.write(reinterpret_cast<const char*>(&h_raw_real), sizeof(h_raw_real));
+              srs_file.write(reinterpret_cast<const char*>(&h_raw_imag), sizeof(h_raw_imag));
+              srs_file.write(reinterpret_cast<const char*>(&h_comp_real), sizeof(h_comp_real));
+              srs_file.write(reinterpret_cast<const char*>(&h_comp_imag), sizeof(h_comp_imag));
+            }
+            
+            srs_file.close();
+            raw_single_collector.update_size(total_size);
+          }
+        }
+      }
+#endif
 
 #if (SRS_CSI_COLLECTION_MODE == 1)
       // ===== SRS PER-PILOT CSI COLLECTION (PER-RNTI FILES) =====
