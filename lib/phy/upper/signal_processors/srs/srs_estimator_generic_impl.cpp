@@ -109,6 +109,11 @@ using namespace srsran;
 #define SRS_CSI_OUTPUT_DIR "/var/tmp/srsRAN_Project/SRS_CSI_Log"
 // ======================================================================
 
+#include <mutex>
+namespace {
+  std::mutex srs_file_mutex;  // Thread-safe file writes
+}
+
 #if (SRS_CSI_COLLECTION_MODE == 1)
 #include <map>
 
@@ -694,10 +699,17 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         
         full_single_collector.packet_counter++;
         
-        // Calculate SNR metrics (placeholders - actual metrics computed at end of function)
-        float rsrp_linear = 0.0f;
-        float noise_variance = 0.0f;
-        float snr_db = 0.0f;
+        // Calculate SNR metrics for this port
+        // RSRP: power of the mean channel coefficient for this port
+        cf_t port_coefficient = srsvec::mean(mean_lse);
+        float rsrp_linear = std::norm(port_coefficient);
+        
+        // Noise variance: compute from the variance of the channel estimates
+        float noise_variance = srsvec::average_power(mean_lse) - rsrp_linear;
+        if (noise_variance < 0) noise_variance = 1e-10f;  // Avoid negative due to numerical errors
+        
+        // SNR in dB
+        float snr_db = (noise_variance > 0) ? 10.0f * std::log10(rsrp_linear / noise_variance) : 0.0f;
         
         // Calculate size: Header(44) + samples(36 bytes × num_tones)
         // Each sample: sc(2) + sym(2) + X(8) + Y(8) + H_raw(8) + H_comp(8) = 36 bytes
@@ -706,6 +718,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         size_t total_size = header_size + sample_size;
         
         if (full_single_collector.should_write(total_size)) {
+          std::lock_guard<std::mutex> lock(srs_file_mutex);  // Thread-safe write
           std::ofstream srs_file(full_single_collector.get_filename(), 
                                 std::ios::binary | std::ios::app);
           
