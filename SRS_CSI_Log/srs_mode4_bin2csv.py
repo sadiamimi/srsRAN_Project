@@ -4,10 +4,11 @@ SRS CSI MODE 4 Binary to CSV Converter
 Converts MODE 4 binary SRS CSI log files (with X[k], Y[k], H_raw[k], H_comp[k]) to CSV.
 
 MODE 4 Binary Format (per entry):
-- Header (44 bytes):
+- Header (46 bytes, current):
   - timestamp_us (8 bytes, uint64): Microseconds since epoch
   - rx_port (2 bytes, uint16): Receive antenna port
   - tx_port (2 bytes, uint16): Transmit antenna port (UE)
+  - rnti (2 bytes, uint16): UE RNTI (0 if unavailable)
   - num_tones (2 bytes, uint16): Number of SRS tones in this entry
   - time_alignment (8 bytes, double): Time alignment in seconds
   - scs_khz (4 bytes, float): Subcarrier spacing in kHz
@@ -44,22 +45,34 @@ from datetime import datetime
 import math
 import argparse
 
-def read_srs_mode4_entry(f):
+def read_srs_mode4_entry(f, header_bytes):
     """Read one SRS CSI MODE 4 entry from binary file."""
-    # Read header (44 bytes)
-    header_data = f.read(44)
-    if len(header_data) < 44:
-        return None
-    
-    # Unpack header
-    # <Q = uint64, H = uint16, d = double, f = float
-    timestamp_us, rx_port, tx_port, num_tones, time_alignment, scs_khz, \
-    comb_size, k0, start_symbol, rsrp_linear, noise_variance, snr_db = \
-        struct.unpack('<QHHHdfHHHfff', header_data)
+    if header_bytes == 46:
+        # Read header (46 bytes): includes RNTI
+        header_data = f.read(46)
+        if len(header_data) < 46:
+            return None
+
+        # <Q = uint64, H = uint16, d = double, f = float
+        timestamp_us, rx_port, tx_port, rnti, num_tones, time_alignment, scs_khz, \
+        comb_size, k0, start_symbol, rsrp_linear, noise_variance, snr_db = \
+            struct.unpack('<QHHHHdfHHHfff', header_data)
+    elif header_bytes == 44:
+        # Legacy header (44 bytes): no RNTI field
+        header_data = f.read(44)
+        if len(header_data) < 44:
+            return None
+
+        timestamp_us, rx_port, tx_port, num_tones, time_alignment, scs_khz, \
+        comb_size, k0, start_symbol, rsrp_linear, noise_variance, snr_db = \
+            struct.unpack('<QHHHdfHHHfff', header_data)
+        rnti = 0
+    else:
+        raise ValueError(f"Unsupported header_bytes={header_bytes}")
     
     # Sanity check: num_tones should be reasonable
     if num_tones > 10000 or num_tones == 0:
-        print(f"Warning: Suspicious num_tones={num_tones} at file position {f.tell()-44}")
+        print(f"Warning: Suspicious num_tones={num_tones} at file position {f.tell()-header_bytes}")
         return None
     
     # Read samples (36 bytes each)
@@ -96,6 +109,7 @@ def read_srs_mode4_entry(f):
         'timestamp_us': timestamp_us,
         'rx_port': rx_port,
         'tx_port': tx_port,
+        'rnti': rnti,
         'num_tones': num_tones,
         'time_alignment': time_alignment,
         'scs_khz': scs_khz,
@@ -125,6 +139,13 @@ Example:
         """
     )
     parser.add_argument('input_file', help='Input binary file (MODE 4 format)')
+    parser.add_argument(
+        '--header-bytes',
+        type=int,
+        choices=[44, 46],
+        default=46,
+        help='MODE 4 header size (44 = legacy without RNTI, 46 = current with RNTI)',
+    )
     
     args = parser.parse_args()
     
@@ -140,7 +161,7 @@ Example:
     print(f"Converting SRS CSI MODE 4 binary file...")
     print(f"  Input:  {input_filename}")
     print(f"  Output: {output_filename}")
-    print(f"  Format: MODE 4 (44-byte header + 36-byte samples)")
+    print(f"  Format: MODE 4 ({args.header_bytes}-byte header + 36-byte samples)")
     print()
     
     entry_count = 0
@@ -149,7 +170,7 @@ Example:
     try:
         with open(input_filename, 'rb') as infile, open(output_filename, 'w') as outfile:
             # Write CSV header
-            outfile.write("entry_num,timestamp_us,timestamp_readable,rx_port,tx_port,num_tones,")
+            outfile.write("entry_num,timestamp_us,timestamp_readable,rx_port,tx_port,rnti,num_tones,")
             outfile.write("time_alignment_sec,scs_khz,comb_size,k0,start_symbol,")
             outfile.write("rsrp_linear,rsrp_dbm,noise_variance,snr_db,")
             outfile.write("subcarrier,symbol,")
@@ -159,7 +180,7 @@ Example:
             outfile.write("h_comp_real,h_comp_imag,h_comp_mag,h_comp_phase_deg\n")
             
             while True:
-                entry = read_srs_mode4_entry(infile)
+                entry = read_srs_mode4_entry(infile, args.header_bytes)
                 if entry is None:
                     break
                 
@@ -194,7 +215,7 @@ Example:
                     
                     # Write entry header info
                     outfile.write(f"{entry_count},{entry['timestamp_us']},{timestamp_readable},")
-                    outfile.write(f"{entry['rx_port']},{entry['tx_port']},{entry['num_tones']},")
+                    outfile.write(f"{entry['rx_port']},{entry['tx_port']},{entry['rnti']},{entry['num_tones']},")
                     outfile.write(f"{entry['time_alignment']:.9e},{entry['scs_khz']:.1f},")
                     outfile.write(f"{entry['comb_size']},{entry['k0']},{entry['start_symbol']},")
                     outfile.write(f"{entry['rsrp_linear']:.6e},{rsrp_dbm:.2f},")

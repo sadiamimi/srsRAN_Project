@@ -91,9 +91,11 @@ using namespace srsran;
 //
 // MODE 4: FULL Single UE CSI - X[k], Y[k], H[k] with metrics (all data in one file)
 //   - File: srs_csi_full_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
-//   - Format: 44-byte header + 28-byte samples (X, Y, H per tone)
-//   - Header: MODE3 header(32) + rsrp(4) + noise_var(4) + snr_db(4)
-//   - Per-tone: subcarrier(2) + symbol(2) + X_real(4) + X_imag(4) + Y_real(4) + Y_imag(4) + H_real(4) + H_imag(4)
+//   - Format: 46-byte header + 36-byte samples (X, Y, H per tone)
+//   - Header: timestamp(8) + rx_port(2) + tx_port(2) + rnti(2) + num_tones(2) + time_align(8) + scs_khz(4) +
+//             comb_size(2) + k0(2) + start_symbol(2) + rsrp(4) + noise_var(4) + snr_db(4)
+//   - Per-tone: subcarrier(2) + symbol(2) + X_real(4) + X_imag(4) + Y_real(4) + Y_imag(4) +
+//               H_raw_real(4) + H_raw_imag(4) + H_comp_real(4) + H_comp_imag(4)
 //   - Collection point: AFTER TA/phase compensation (compensated CSI)
 //   - Includes: Transmitted sequence X[k], Received signal Y[k], Compensated channel H[k]
 //   - Metrics: RSRP, noise variance, SNR in dB
@@ -460,6 +462,33 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
   // Extract comb size.
   auto comb_size = static_cast<unsigned>(config.resource.comb_size);
 
+#if (SRS_CSI_COLLECTION_MODE == 4)
+  // Parse RNTI from the context formatter output. srs_context does not expose getters.
+  uint16_t rnti_u16 = 0;
+  if (config.context.has_value()) {
+    const std::string context_str = fmt::format("{}", config.context.value());
+    const size_t      rnti_pos    = context_str.find("rnti=0x");
+    if (rnti_pos != std::string::npos) {
+      const size_t start  = rnti_pos + 7; // len("rnti=0x")
+      size_t       end    = start;
+      auto         is_hex = [](char c) {
+        return ((c >= '0') && (c <= '9')) || ((c >= 'a') && (c <= 'f')) || ((c >= 'A') && (c <= 'F'));
+      };
+      while ((end < context_str.size()) && is_hex(context_str[end])) {
+        ++end;
+      }
+
+      if (end > start) {
+        try {
+          rnti_u16 = static_cast<uint16_t>(std::stoul(context_str.substr(start, end - start), nullptr, 16));
+        } catch (...) {
+          rnti_u16 = 0;
+        }
+      }
+    }
+  }
+#endif
+
   srs_information common_info = get_srs_information(config.resource, 0);
 
   // Sequence length is common for all ports and symbols.
@@ -711,9 +740,9 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         // SNR in dB
         float snr_db = (noise_variance > 0) ? 10.0f * std::log10(rsrp_linear / noise_variance) : 0.0f;
         
-        // Calculate size: Header(44) + samples(36 bytes × num_tones)
+        // Calculate size: Header(46) + samples(36 bytes per tone * num_tones)
         // Each sample: sc(2) + sym(2) + X(8) + Y(8) + H_raw(8) + H_comp(8) = 36 bytes
-        size_t header_size = 44;
+        size_t header_size = 46;
         size_t sample_size = mean_lse.size() * 36;
         size_t total_size = header_size + sample_size;
         
@@ -730,10 +759,11 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             srs_information info_mode4 = get_srs_information(config.resource, i_antenna_port);
             unsigned comb_size_val = static_cast<unsigned>(config.resource.comb_size);
             
-            // 44-byte header
+            // 46-byte header
             int64_t ts = timestamp_us;
             uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
             uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
+            uint16_t rnti_u16_hdr = rnti_u16;
             uint16_t seq_len_u16 = static_cast<uint16_t>(mean_lse.size());
             double time_align = result.time_alignment.time_alignment;
             float scs_khz_val = static_cast<float>(scs_to_khz(scs));
@@ -744,6 +774,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             srs_file.write(reinterpret_cast<const char*>(&ts), sizeof(ts));
             srs_file.write(reinterpret_cast<const char*>(&rx_port_u16), sizeof(rx_port_u16));
             srs_file.write(reinterpret_cast<const char*>(&tx_port_u16), sizeof(tx_port_u16));
+            srs_file.write(reinterpret_cast<const char*>(&rnti_u16_hdr), sizeof(rnti_u16_hdr));
             srs_file.write(reinterpret_cast<const char*>(&seq_len_u16), sizeof(seq_len_u16));
             srs_file.write(reinterpret_cast<const char*>(&time_align), sizeof(time_align));
             srs_file.write(reinterpret_cast<const char*>(&scs_khz_val), sizeof(scs_khz_val));
