@@ -1,0 +1,16 @@
+date: 2026-04-27
+bandwidth_mhz: 20
+command: sudo /var/tmp/srsRAN_Project/build/apps/gnb/gnb -c /var/tmp/etc/ocudu/gnb_rf_n310_tdd_n78_20mhz.yml
+config_path: /var/tmp/etc/ocudu/gnb_rf_n310_tdd_n78_20mhz.yml
+commit: 0d717ffa5b
+uhd_version: 4.7.0.0+ds1-2emulab1
+device: n310
+radio_type: uhd
+pci: 1
+dl_arfcn: 629334
+ul_arfcn: 629334
+dl_freq_mhz: 3440.01
+ul_freq_mhz: 3440.01
+dl_ssb_arfcn: 628992
+amf_ip: 10.53.1.2
+amf_port: 38412

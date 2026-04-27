@@ -1,0 +1,14 @@
+date: 2026-04-27
+bandwidth_mhz: 40
+radio_type: uhd
+uhd_version: 4.7.0.0+ds1-2emulab1
+device: n310
+master_clock_rate_hz: 122880000
+send_frame_size: 8000
+recv_frame_size: 8000
+pci: 1
+dl_arfcn: 628668
+ul_arfcn: 628668
+dl_freq_mhz: 3430.02
+ul_freq_mhz: 3430.02
+dl_ssb_arfcn: 627648
