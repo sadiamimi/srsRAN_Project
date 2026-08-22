@@ -101,7 +101,7 @@ using namespace srsran;
 //   - Rotation: New file created when current file reaches 100MB
 //   - Use case: Complete channel characterization
 //
-#define SRS_CSI_COLLECTION_MODE 0
+#define SRS_CSI_COLLECTION_MODE 4
 
 // File size limit (100 MB) - creates new file when reached
 #define SRS_CSI_MAX_FILE_SIZE (100UL * 1024 * 1024)
