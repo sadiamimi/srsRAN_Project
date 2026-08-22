@@ -89,18 +89,17 @@ using namespace srsran;
 //   - Rotation: New file created when current file reaches 100MB
 //   - Use case: Single UE testing, raw uncompensated channel data
 //
-// MODE 4: FULL Single UE CSI - X[k], Y[k], H[k] with metrics (all data in one file)
+// MODE 4: FULL Single UE CSI - X[k], Y[k], H[k] (all data in one file)
 //   - File: srs_csi_full_YYYYMMDD_HHMMSS_N.bin (single file for all UEs)
-//   - Format: 46-byte header + 36-byte samples (X, Y, H per tone)
+//   - Format: 34-byte header + 36-byte samples (X, Y, H per tone)
 //   - Header: timestamp(8) + rx_port(2) + tx_port(2) + rnti(2) + num_tones(2) + time_align(8) + scs_khz(4) +
-//             comb_size(2) + k0(2) + start_symbol(2) + rsrp(4) + noise_var(4) + snr_db(4)
+//             comb_size(2) + k0(2) + start_symbol(2)
 //   - Per-tone: subcarrier(2) + symbol(2) + X_real(4) + X_imag(4) + Y_real(4) + Y_imag(4) +
 //               H_raw_real(4) + H_raw_imag(4) + H_comp_real(4) + H_comp_imag(4)
 //   - Collection point: AFTER TA/phase compensation (compensated CSI)
 //   - Includes: Transmitted sequence X[k], Received signal Y[k], Compensated channel H[k]
-//   - Metrics: RSRP, noise variance, SNR in dB
 //   - Rotation: New file created when current file reaches 100MB
-//   - Use case: Complete channel characterization with SNR analysis
+//   - Use case: Complete channel characterization
 //
 #define SRS_CSI_COLLECTION_MODE 0
 
@@ -716,10 +715,9 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
       compensate_phase_shift(mean_lse, phase_shift_subcarrier, phase_shift_offset);
 
 #if (SRS_CSI_COLLECTION_MODE == 4)
-      // ===== FULL SINGLE UE SRS CSI COLLECTION (X[k], Y[k], H_raw[k], H_comp[k] + METRICS) =====
+      // ===== FULL SINGLE UE SRS CSI COLLECTION (X[k], Y[k], H_raw[k], H_comp[k]) =====
       // Captures complete channel information: transmitted sequence, received signal,
-      // raw channel estimate (before compensation), compensated channel estimate, 
-      // plus RSRP, noise variance, and SNR
+      // raw channel estimate (before compensation), and compensated channel estimate.
       {
         // Initialize collector on first use
         if (!full_single_collector.initialized) {
@@ -728,21 +726,9 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
         
         full_single_collector.packet_counter++;
         
-        // Calculate SNR metrics for this port
-        // RSRP: power of the mean channel coefficient for this port
-        cf_t port_coefficient = srsvec::mean(mean_lse);
-        float rsrp_linear = std::norm(port_coefficient);
-        
-        // Noise variance: compute from the variance of the channel estimates
-        float noise_variance = srsvec::average_power(mean_lse) - rsrp_linear;
-        if (noise_variance < 0) noise_variance = 1e-10f;  // Avoid negative due to numerical errors
-        
-        // SNR in dB
-        float snr_db = (noise_variance > 0) ? 10.0f * std::log10(rsrp_linear / noise_variance) : 0.0f;
-        
-        // Calculate size: Header(46) + samples(36 bytes per tone * num_tones)
+        // Calculate size: Header(34) + samples(36 bytes per tone * num_tones)
         // Each sample: sc(2) + sym(2) + X(8) + Y(8) + H_raw(8) + H_comp(8) = 36 bytes
-        size_t header_size = 46;
+        size_t header_size = 34;
         size_t sample_size = mean_lse.size() * 36;
         size_t total_size = header_size + sample_size;
         
@@ -759,7 +745,7 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             srs_information info_mode4 = get_srs_information(config.resource, i_antenna_port);
             unsigned comb_size_val = static_cast<unsigned>(config.resource.comb_size);
             
-            // 46-byte header
+            // 34-byte header
             int64_t ts = timestamp_us;
             uint16_t rx_port_u16 = static_cast<uint16_t>(i_rx_port);
             uint16_t tx_port_u16 = static_cast<uint16_t>(i_antenna_port);
@@ -781,10 +767,6 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
             srs_file.write(reinterpret_cast<const char*>(&comb_size_u16), sizeof(comb_size_u16));
             srs_file.write(reinterpret_cast<const char*>(&k0_u16), sizeof(k0_u16));
             srs_file.write(reinterpret_cast<const char*>(&start_sym_u16), sizeof(start_sym_u16));
-            srs_file.write(reinterpret_cast<const char*>(&rsrp_linear), sizeof(rsrp_linear));
-            srs_file.write(reinterpret_cast<const char*>(&noise_variance), sizeof(noise_variance));
-            srs_file.write(reinterpret_cast<const char*>(&snr_db), sizeof(snr_db));
-            
             // Get transmitted SRS sequence and received signal
             span<const cf_t> srs_sequence = all_sequences.get_view({i_antenna_port});
             unsigned symbol_idx = config.resource.start_symbol.value();
